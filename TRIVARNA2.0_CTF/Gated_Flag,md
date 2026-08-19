@@ -1,0 +1,316 @@
+# TRIVARNA 2.0 — Time/Sensor/Environment-Gated Flag (chal07)
+
+**Category:** Reverse Engineering / Android
+**Points:** 200
+**Difficulty:** Medium
+
+## TL;DR
+
+The app gates its flag behind three native (JNI) checks — a device fingerprint
+allowlist, an accelerometer noise-variance window, and a monotonic elapsed-time
+sanity check — but the flag itself is a **static string baked into `.rodata`**
+in `libcheck.so`. Since the native code returns that constant unconditionally
+once the checks pass (rather than deriving/computing it from the inputs), it
+can be recovered directly from the shared object without ever running the app
+or satisfying the runtime gate.
+
+```
+TRIVARNA{3nv_6473d_s3ns0r_f1n63rpR1n7_707p_c0mb1n3_3910}
+```
+
+---
+
+## Challenge Description
+
+> This application uses a multi-factor environmental validation chain in
+> native code (`libcheck.so`) before releasing the flag:
+>
+> 1. **Accelerometer Noise Floor Sampling** — Samples accelerometer sensor
+>    readings over 2–3 seconds and calculates variance. Stock emulators
+>    producing zero noise floor or synthetic flatlines fail.
+> 2. **Device Fingerprint Whitelisting** — Checks `Build.FINGERPRINT` against
+>    a hash whitelist table.
+> 3. **Rolling Boot-Time TOTP Window** — Validates a rolling time value
+>    calculated from `SystemClock.elapsedRealtime()` with a 3-step (90-second)
+>    tolerance window.
+
+We're given a single APK, `chal07.apk`.
+
+---
+
+## Setup
+
+```bash
+mkdir ctf && cd ctf
+unzip -o chal07.apk -d extracted
+find extracted -type f | sort
+```
+
+```
+extracted/
+├── AndroidManifest.xml
+├── classes.dex
+├── lib/
+│   ├── arm64-v8a/libcheck.so
+│   └── x86_64/libcheck.so
+├── resources.arsc
+└── ...
+```
+
+Two things stand out immediately: a `classes.dex` for the Kotlin/Java app
+logic, and `libcheck.so` (shipped for both `arm64-v8a` and `x86_64`) which is
+where the actual validation clearly happens, per the challenge description.
+
+---
+
+## Step 1 — Decompiling the DEX
+
+I used [Androguard](https://github.com/androguard/androguard) to pull the app
+source straight out of the DEX without needing an emulator or JADX GUI:
+
+```python
+from androguard.misc import AnalyzeAPK
+
+a, d, dx = AnalyzeAPK("chal07.apk")
+for c in d[0].get_classes():
+    if "chal07" in c.get_name():
+        print(c.get_source())
+```
+
+This surfaces two classes worth reading closely: `EnvCheck` and
+`MainActivity`.
+
+### `EnvCheck` — the JNI bridge
+
+```java
+public final class EnvCheck {
+    public static final EnvCheck INSTANCE;
+
+    static {
+        INSTANCE = new EnvCheck();
+        System.loadLibrary("check");
+    }
+
+    public final native String nativeDeriveFlag(
+        String p0, double p1, long p2, long p3, long p4
+    );
+}
+```
+
+One native entry point, `nativeDeriveFlag`, taking a `String`, a `double`, and
+three `long`s. Everything interesting happens on the native side.
+
+### `MainActivity` — building the inputs
+
+Trimmed to the relevant parts:
+
+```java
+private final void startSampling() {
+    ...
+    this.e0 = SystemClock.elapsedRealtime();     // t0: register listener
+    sensorManager.registerListener(this, accel, SensorManager.SENSOR_DELAY_NORMAL);
+    handler.postDelayed(() -> { e1 = SystemClock.elapsedRealtime(); }, 1250);
+    handler.postDelayed(() -> {
+        e2 = SystemClock.elapsedRealtime();
+        sensorManager.unregisterListener(this);
+        finishCheck();
+    }, 2500);
+}
+
+public void onSensorChanged(SensorEvent event) {
+    float[] v = event.values;
+    magnitudes.add(sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]));
+}
+
+private final void finishCheck() {
+    double mean     = magnitudes.average();
+    double variance  = magnitudes.sumOf { (it - mean) * (it - mean) } / magnitudes.size();
+
+    String fpHash = sha256Hex(Build.FINGERPRINT);
+
+    String flag = EnvCheck.INSTANCE.nativeDeriveFlag(fpHash, variance, e0, e1, e2);
+    status.setText(flag ?? "environment check failed");
+}
+```
+
+So the five arguments handed to native code are exactly what the challenge
+description promised:
+
+| Arg | Meaning |
+|---|---|
+| `p0` (String) | `SHA-256(Build.FINGERPRINT)` in lowercase hex |
+| `p1` (double) | Variance of accelerometer magnitude samples over ~2.5s |
+| `p2` (long) | `e0` — timestamp when the sensor listener registered |
+| `p3` (long) | `e1` — timestamp at the 1.25s mark |
+| `p4` (long) | `e2` — timestamp at the 2.5s mark (listener unregistered) |
+
+At this point the Kotlin/Java side is fully understood — all the actual
+gatekeeping logic lives inside `libcheck.so`.
+
+---
+
+## Step 2 — Reversing `libcheck.so`
+
+```bash
+cd extracted/lib/x86_64
+file libcheck.so
+# ELF 64-bit LSB shared object, x86-64, stripped
+
+nm -D --defined-only libcheck.so
+# 00000000000007d0 T Java_com_ctf_chal07_EnvCheck_nativeDeriveFlag
+```
+
+Stripped, but the JNI export naming convention hands us the entry point for
+free. A quick strings pass is always worth doing before reaching for a
+disassembler:
+
+```bash
+strings -n 6 libcheck.so
+```
+
+```
+Java_com_ctf_chal07_EnvCheck_nativeDeriveFlag
+strcmp
+?512184b2b799bfbf3b33b134dd1320bca856a3d6ebdc9187c527d83cda61eac2
+40669084df34c6ad268d25004b9bbcdf8f872444c2aa7faa474a24bad7bc75b9
+6af850e1d32086c4d86f0b18bf4dc0a7cdb73e6c3d977877451c715cc7c72ebd
+STUSEC{3nv_6473d_s3ns0r_f1n63rpR1n7_707p_c0mb1n3_3910}
+```
+
+Two very useful things fall out immediately:
+
+- **Three SHA-256 hex hashes** sitting in `.rodata` — almost certainly the
+  device-fingerprint allowlist referenced in the challenge description, and
+  a target for `strcmp`.
+- **A flag-shaped string**, already fully readable in plaintext.
+
+That second point is the whole game. If the native function is simply
+returning this constant when the gate opens (rather than computing it from
+the inputs at runtime), we don't need to satisfy the gate at all — we just
+need to confirm that's what's happening.
+
+### Confirming it with disassembly
+
+```bash
+objdump -d --no-show-raw-insn libcheck.so
+```
+
+Reconstructing `Java_com_ctf_chal07_EnvCheck_nativeDeriveFlag` (System V x86-64
+JNI calling convention: `rdi`=`JNIEnv*`, `rdx`=fingerprint `jstring`,
+`xmm0`=variance, `rcx`/`r8`/`r9`=`e0`/`e1`/`e2`):
+
+```
+7f3: mov  (%rdi),%rax
+7fb: call *0x548(%rax)          ; GetStringUTFChars(env, fpHashStr, NULL)
+801: mov  %rax,%rbp             ; rbp = fingerprint hash C-string
+
+804: lea  0x561,%rsi ; call strcmp(rbp, hash1)   ; je -> match, skip to release
+817: lea  0x520,%rsi ; call strcmp(rbp, hash2)   ; je -> match, skip to release
+82a: lea  0x5a2,%rsi ; call strcmp(rbp, hash3)   ; result kept in r14d
+
+847: call *0x550(%rax)          ; ReleaseStringUTFChars
+859: test %r14d,%r14d
+86d: jne  8e2                   ; none of the 3 hashes matched -> fail
+
+; variance must sit inside [lower, upper]
+86f/893: ucomisd 0x510(%rip),%xmm1   ; variance vs lower bound
+89d: ucomisd %xmm1,%xmm0             ; upper bound vs variance
+       jb 8e2                        ; out of range -> fail
+
+; timestamp sanity
+8ab: cmp $0x15f90,%r12   ; jl 8e2   ; e0 must be >= 90000 ms uptime
+8b4: cmp %r15,%r12       ; jge 8e2  ; require e0 <  e1
+8b9: cmp %r14,%r15       ; jge 8e2  ; require e1 <  e2
+
+; all checks passed
+8be: mov  (%rbx),%rax
+8c1: mov  0x538(%rax),%rax      ; NewStringUTF
+8c8: lea  0x5e3,%rsi            ; <-- address of "STUSEC{...}"
+8cf: mov  %rbx,%rdi
+8e0: jmp  *%rax                 ; return NewStringUTF(env, "STUSEC{...}")
+```
+
+That confirms it: on success, the function does **not** build a new string
+from any of the inputs. It just calls `NewStringUTF` on a **fixed address in
+`.rodata`** and hands that back to Java. The flag is a compile-time constant;
+the native checks only decide *whether* to hand it back, never *what* it is.
+
+Decoding the two `ucomisd` doubles for completeness:
+
+```python
+import struct
+struct.unpack('<d', bytes.fromhex('fca9f1d24d62503f'))[0]  # 0.001
+struct.unpack('<d', bytes.fromhex('9a99999999999a3f'))[0]  # 0.025976...
+```
+
+So the "noise floor" check wants variance in `[0.001, 0.026)` — tight enough
+to reject a dead-flat emulator (`variance == 0`) but loose enough for a real
+phone resting on a desk. `0x15f90 == 90000`, matching the "boot-time TOTP,
+90-second tolerance" flavor text (`e0` must reflect at least 90s of device
+uptime).
+
+### Pulling the flag straight from `.rodata`
+
+Since it's a static constant, no need to satisfy any of the above — just dump
+the section:
+
+```bash
+objdump -s -j .rodata libcheck.so
+```
+
+```
+05e0  ...53 5455 5345 437b 336e 765f 3634  ...STUSEC{3nv_64
+05f0  3733 645f 7333 6e73 3072 5f66 316e 6333  73d_s3ns0r_f1n63
+0600  7270 5231 6e37 5f37 3037 705f 6330 6d62  rpR1n7_707p_c0mb
+0610  316e 335f 3339 3130 7d00                1n3_3910}
+```
+
+Decoded: `STUSEC{3nv_6473d_s3ns0r_f1n63rpR1n7_707p_c0mb1n3_3910}`
+
+The `STUSEC{}` wrapper is a leftover from whatever template this binary was
+built from — this event's flags are formatted `TRIVARNA{...}`, so the string
+just needs re-wrapping:
+
+```
+TRIVARNA{3nv_6473d_s3ns0r_f1n63rpR1n7_707p_c0mb1n3_3910}
+```
+
+---
+
+## Root Cause
+
+The design intent was clearly "flag is unlocked only after passing an
+environment/sensor/timing gate implemented in native code." The flaw is
+architectural: **the value being protected and the logic protecting it live
+in the same static, unencrypted binary.** The gate controls *whether*
+`NewStringUTF` gets called on a fixed `.rodata` offset — it never transforms,
+decrypts, or derives the string from the validated inputs. Since the checks
+never actually change the bytes being returned, they add zero cost to an
+attacker who reads the binary instead of running it.
+
+A stronger version of this challenge would derive the flag as a function of
+the validated inputs (e.g., XOR/AES-decrypt the flag using bytes drawn from
+the fingerprint hash, the variance value, and the timestamps), so recovering
+it requires actually satisfying — or precisely emulating — the runtime
+checks, not just locating a string literal.
+
+---
+
+## Tools Used
+
+- [`androguard`](https://github.com/androguard/androguard) — DEX → Java-like
+  source recovery
+- `unzip`, `file`, `nm`, `strings`, `objdump` — standard Linux binutils for
+  static ELF analysis
+- Python (`struct`) — decoding raw IEEE-754 doubles from `.rodata`
+
+No emulator, rooted device, Frida, or dynamic instrumentation was required —
+the entire solve was static.
+
+---
+
+## Flag
+
+```
+TRIVARNA{3nv_6473d_s3ns0r_f1n63rpR1n7_707p_c0mb1n3_3910}
+```
